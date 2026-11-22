@@ -96,9 +96,11 @@ def status_phrase(status_code: int) -> bytes:
     phrases = {
         200: b"OK",
         400: b"Bad Request",
+        403: b"Forbidden",
         405: b"Method Not Allowed",
         408: b"Request Timeout",
         411: b"Length Required",
+        413: b"Payload Too Large",
         417: b"Expectation Failed",
         502: b"Bad Gateway",
         504: b"Gateway Timeout",

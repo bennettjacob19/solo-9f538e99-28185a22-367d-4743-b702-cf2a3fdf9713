@@ -21,8 +21,11 @@ class Settings:
     permission_timeout: float = 10.0
     # 连接上任意一次读事件的空闲超时
     idle_timeout: float = 30.0
-    # 样例源站 /reject-mid 读取多少字节后拒收
+    # 样例源站 /reject-mid 与 /reject-slow 读取多少字节后拒收
     reject_after_bytes: int = 4096
+    # 样例源站 /reject-slow 分段慢发 413 说明的段数与段间间隔（秒）
+    reject_slow_segments: int = 4
+    reject_slow_delay: float = 0.4
 
 
 def env_settings() -> Settings:
@@ -40,4 +43,6 @@ def env_settings() -> Settings:
         permission_timeout=_get("PERMISSION_TIMEOUT", 10.0),
         idle_timeout=_get("IDLE_TIMEOUT", 30.0),
         reject_after_bytes=_get("REJECT_AFTER_BYTES", 4096),
+        reject_slow_segments=_get("REJECT_SLOW_SEGMENTS", 4),
+        reject_slow_delay=_get("REJECT_SLOW_DELAY", 0.4),
     )

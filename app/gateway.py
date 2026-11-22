@@ -9,8 +9,11 @@
 * 源站回 100 后，网关向终端回 100，随后边收边转请求正文；
 * 源站在许可阶段直接回最终响应（拒收）：原样转回终端，不转发正文，回 504 同理；
 * 等许可超时：网关自己回 ``504 Gateway Timeout``，不转发正文；
-* 转发正文途中源站提前给最终响应（中途拒收）：立即停止读取/转发正文，
-  终端不必发完 body 就能拿到最终响应；
+* 转发正文途中源站提前给最终响应（中途拒收）：**识别到最终响应头的那一刻
+  就停止向源站写入新的上传数据**；此后只要拒收正文各段都在读空闲时限内
+  到达，就把原状态码和完整正文转回终端——即使终端已经停发；
+* 源站响应没有 ``Content-Length``（如分块慢发的拒收说明）时，向终端侧
+  重新加分块编码，保证消息边界明确；
 * 一条连接处理完即关，不做 keep-alive 复用。
 """
 
@@ -20,6 +23,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from collections.abc import Callable
 
 import h11
 
@@ -114,8 +118,15 @@ async def _forward_origin_final_response(
     origin_reader: asyncio.StreamReader,
     settings: Settings,
     first_event: h11.Response | None = None,
+    on_response: Callable[[], None] | None = None,
 ) -> None:
-    """把源站的最终响应（含 body）完整转发给终端。"""
+    """把源站的最终响应（含 body）完整转发给终端。
+
+    * 识别到最终响应头时调用 ``on_response``（用于让上传泵立即停止）；
+    * 源站响应没有 ``Content-Length``（如分块慢发的拒收说明）时，向终端侧
+      重新加分块编码，保证终端有明确的消息边界，不必依赖连接关闭定界；
+    * 只要响应各段都在读空闲时限内到达，就把完整正文转完。
+    """
     event = first_event
     while True:
         if event is None:
@@ -124,11 +135,16 @@ async def _forward_origin_final_response(
             raise PeerClosed("源站在响应结束前关闭连接")
         if isinstance(event, h11.Response):
             headers = filter_forward_headers(event.headers)
+            if not any(n.lower() == b"content-length" for n, _ in headers):
+                # 源站按分块/关闭定界发的正文，重新以 chunked 框定，终端无需等 EOF
+                headers.append((b"transfer-encoding", b"chunked"))
             forwarded = h11.Response(
                 status_code=event.status_code,
                 headers=headers,
                 reason=event.reason or status_phrase(event.status_code),
             )
+            if on_response is not None:
+                on_response()
             await send_event(terminal, terminal_writer, forwarded)
         elif isinstance(event, h11.Data):
             await send_event(terminal, terminal_writer, event)
@@ -171,6 +187,29 @@ async def _pump_body_to_origin(
     if not isinstance(event, h11.EndOfMessage):
         raise GatewayError(400, "Content-Length 已读完但未收到消息结束标记")
     await send_event(origin, origin_writer, h11.EndOfMessage())
+
+
+# 拒收路径上、关闭终端连接前的引流时限：读掉终端在途正文，避免带未读数据
+# 直接 close 触发 RST，把已转回给终端的拒收说明尾段打掉
+_DRAIN_BEFORE_CLOSE_TIMEOUT = 2.0
+
+
+async def _drain_terminal_stream(
+    terminal_reader: asyncio.StreamReader, timeout: float
+) -> None:
+    """在 ``timeout`` 秒总预算内读掉终端剩余的在途字节（尽力而为，出错即返回）。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            chunk = await asyncio.wait_for(terminal_reader.read(65536), remaining)
+            if not chunk:
+                return
+    except (asyncio.TimeoutError, ConnectionError, OSError):
+        pass
 
 
 async def handle_terminal(
@@ -252,6 +291,12 @@ async def handle_terminal(
         )
 
         # ---- 阶段 4：边收边转正文，同时监听源站的中途拒收 ------------------
+        # 关键约定：
+        # * 一旦识别到源站的最终响应头，立即停止向源站写入新的上传数据；
+        # * 此后只要拒收正文各段都在读空闲时限内到达，就把原状态码和完整
+        #   正文转回终端——即使终端已经停发，也绝不中途掐断响应转发。
+        final_response_seen = asyncio.Event()
+
         pump_task = asyncio.create_task(
             _pump_body_to_origin(
                 terminal, terminal_reader, origin, origin_writer,
@@ -261,37 +306,61 @@ async def handle_terminal(
         relay_task = asyncio.create_task(
             _forward_origin_final_response(
                 terminal, terminal_writer, origin, origin_reader, settings,
+                on_response=final_response_seen.set,
             )
         )
+        watch_task = asyncio.create_task(final_response_seen.wait())
 
         try:
-            done, pending = await asyncio.wait(
-                {pump_task, relay_task}, return_when=asyncio.FIRST_COMPLETED,
+            await asyncio.wait(
+                {pump_task, relay_task, watch_task},
+                return_when=asyncio.FIRST_COMPLETED,
             )
         except asyncio.CancelledError:
             pump_task.cancel()
             relay_task.cancel()
             raise
+        finally:
+            watch_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watch_task
 
-        if relay_task in done:
-            # 源站中途拒收（或在 body 转发完前后很快回了响应）：
-            # 立即停止转发，终端无需发完正文
-            pump_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await pump_task
-            exc = relay_task.exception()
-            if exc is not None:
-                raise exc
-            log.info("终端 %s 源站最终响应已转回，停止正文转发", peer)
+        pump_finished = (
+            pump_task.done()
+            and not pump_task.cancelled()
+            and pump_task.exception() is None
+        )
+
+        if final_response_seen.is_set():
+            # 源站已给最终响应（中途拒收或正文刚发完就回响应）：
+            # 1) 上传泵若还在跑，立即停掉——不再向源站写入新的上传数据；
+            # 2) 响应转发不受终端停发/断开影响，必须完整转完。
+            if not pump_task.done():
+                log.info("终端 %s 源站最终响应头已到，停止向源站写上传数据", peer)
+                pump_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await pump_task
+            elif not pump_finished and not pump_task.cancelled():
+                log.info("终端 %s 上传泵已停（%r），继续转回源站响应",
+                         peer, pump_task.exception())
+            await relay_task
+            if not pump_finished:
+                # 终端可能还有在途正文：短暂引流后再关连接，避免 RST
+                # 打掉刚转回的拒收说明
+                await _drain_terminal_stream(
+                    terminal_reader, _DRAIN_BEFORE_CLOSE_TIMEOUT
+                )
         else:
-            # 正文已全部转发且 pump 正常结束：等 relay 把源站最终响应转完，
-            # 不取消它，避免重复转发响应头
+            # 源站尚未回最终响应，上传泵先结束（relay 完成前必然已识别
+            # 响应头并置位 final_response_seen，所以此处 relay 必未完成、
+            # 泵必然已结束）
             exc = pump_task.exception()
             if exc is not None:
                 relay_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await relay_task
                 raise exc
+            # 正文已全部转发且泵正常结束：等 relay 把源站最终响应转完
             await relay_task
 
     except GatewayError as exc:

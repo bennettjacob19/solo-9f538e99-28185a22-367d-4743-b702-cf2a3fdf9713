@@ -5,6 +5,8 @@ services:
     environment:
       ORIGIN_PORT: "8081"
       REJECT_AFTER_BYTES: "4096"
+      REJECT_SLOW_SEGMENTS: "4"
+      REJECT_SLOW_DELAY: "0.4"
       IDLE_TIMEOUT: "30"
     ports:
       - "8081:8081"

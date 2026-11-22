@@ -11,7 +11,9 @@ from app.origin import OriginStats
 
 class Harness:
     def __init__(self, *, permission_timeout: float = 2.0,
-                 reject_after_bytes: int = 4096):
+                 reject_after_bytes: int = 4096,
+                 reject_slow_segments: int = 4,
+                 reject_slow_delay: float = 0.1):
         self.settings = Settings(
             gateway_host="127.0.0.1",
             gateway_port=0,
@@ -20,6 +22,8 @@ class Harness:
             permission_timeout=permission_timeout,
             idle_timeout=10.0,
             reject_after_bytes=reject_after_bytes,
+            reject_slow_segments=reject_slow_segments,
+            reject_slow_delay=reject_slow_delay,
         )
         self.stats = OriginStats()
         self._origin_server: asyncio.AbstractServer | None = None

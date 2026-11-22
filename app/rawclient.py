@@ -4,7 +4,9 @@
 
 1. 请求头发完、正文暂缓；
 2. 收到 100 Continue（许可）后才开始推正文；
-3. 收到最终响应；若源站中途拒收，未发完的正文立即放弃。
+3. 收到最终响应；若源站中途拒收，未发完的正文立即放弃；
+4. 最终响应完整读回即返回——即使发送协程仍堵在写缓冲区
+   （对端停读、缓冲区未腾空）也不再等。
 
 返回值里带 ``timeline``（相对开始时间的毫秒级事件序列）和最终响应。
 """
@@ -138,13 +140,10 @@ async def upload_once(
             asyncio.create_task(final_arrived.wait()),
         }
         try:
-            done, _ = await asyncio.wait(
+            await asyncio.wait(
                 wait_tasks, return_when=asyncio.FIRST_COMPLETED,
                 timeout=permission_timeout,
             )
-        except asyncio.TimeoutError:
-            mark("permission_wait_timeout")
-            raise
         finally:
             for task in wait_tasks:
                 if not task.done():
@@ -152,8 +151,12 @@ async def upload_once(
                     with contextlib.suppress(asyncio.CancelledError):
                         await task
         if not permission.is_set():
-            mark("final_response_before_permission",
-                 bytes_sent=result.body_bytes_sent)
+            if final_arrived.is_set():
+                # 许可前的拒收：直接返回，正文一字不发
+                mark("final_response_before_permission",
+                     bytes_sent=result.body_bytes_sent)
+            else:
+                mark("permission_wait_timeout")
             return
 
         remaining = body_size
@@ -193,14 +196,31 @@ async def upload_once(
                 return_when=asyncio.FIRST_COMPLETED,
                 timeout=overall_timeout,
             )
+            if not done:
+                # asyncio.wait 超时会返回空集合而不是抛异常
+                result.error = result.error or "overall timeout"
+                mark("overall_timeout")
+                break
             for task in done:
-                if task.exception() is not None and result.error is None:
-                    exc = task.exception()
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc is not None and result.error is None:
                     result.error = f"{type(exc).__name__}: {exc}"
                     mark("task_error", error=str(exc))
-    except asyncio.TimeoutError:
-        result.error = result.error or "overall timeout"
-        mark("overall_timeout")
+            # 最终响应已完整读回：发送协程若仍堵在写缓冲区（对端已停读、
+            # 缓冲区迟迟腾不出），直接放弃发送——读完拒收响应即可返回
+            if (
+                recv_task in done
+                and result.status_code is not None
+                and not send_task.done()
+            ):
+                mark("send_abandoned_after_final_response",
+                     bytes_sent=result.body_bytes_sent)
+                send_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await send_task
+                pending.discard(send_task)
     except (ConnectionError, BrokenPipeError, h11.RemoteProtocolError,
             h11.LocalProtocolError) as exc:
         result.error = f"{type(exc).__name__}: {exc}"

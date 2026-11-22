@@ -6,6 +6,10 @@
 * ``POST /reject``      —— 看了请求头直接拒收（回 403），**不发 100、不读 body**
 * ``POST /reject-mid``  —— 先回 100，读够 ``REJECT_AFTER_BYTES`` 字节后中途回 413，
                            不再读取剩余正文
+* ``POST /reject-slow`` —— 先回 100，读够 ``REJECT_AFTER_BYTES`` 字节后回 413，
+                           拒收说明按 ``Transfer-Encoding: chunked`` 分多段慢发
+                          （段数/间隔由 ``REJECT_SLOW_SEGMENTS`` /
+                           ``REJECT_SLOW_DELAY`` 控制）
 * ``POST /hang``        —— 收到请求头后保持沉默，用来制造许可超时（网关回 504）
 * ``GET  /stats``       —— 返回各路径累计实收的正文字节数
 * ``POST /stats/reset`` —— 清零计数器
@@ -77,6 +81,37 @@ def _json_response(status: int, payload: dict) -> tuple[h11.Response, h11.Data,
 async def _send_json(conn, writer, status: int, payload: dict) -> None:
     for event in _json_response(status, payload):
         await send_event(conn, writer, event)
+
+
+async def _send_slow_413(conn, writer, received: int, settings: Settings) -> None:
+    """分多段慢发 413 拒收说明（``Transfer-Encoding: chunked``）。
+
+    用来模拟“诊断包还在上传、源站分段发拒收说明”的场景：各段之间间隔
+    ``reject_slow_delay`` 秒，网关必须在读空闲时限内逐段转回终端。
+    """
+    lines = [
+        "413 Payload Too Large：诊断包超过源站接收上限，已拒收。\n",
+        f"拒收前源站实收上传正文 {received} 字节。\n",
+        "剩余正文不再读取，请停止继续上传。\n",
+        "建议：压缩或分片后重试，或联系管理员上调接收上限。\n",
+    ]
+    segments = max(1, settings.reject_slow_segments)
+    response = h11.Response(
+        status_code=413,
+        headers=[
+            (b"content-type", b"text/plain; charset=utf-8"),
+            (b"transfer-encoding", b"chunked"),
+            (b"connection", b"close"),
+        ],
+    )
+    await send_event(conn, writer, response)
+    for index in range(segments):
+        await send_event(
+            conn, writer,
+            h11.Data(data=lines[index % len(lines)].encode("utf-8")),
+        )
+        await asyncio.sleep(settings.reject_slow_delay)
+    await send_event(conn, writer, h11.EndOfMessage())
 
 
 async def _drain_body_until(
@@ -152,11 +187,11 @@ async def _handle(
                 pass
             return
 
-        if target not in ("/accept", "/reject-mid"):
+        if target not in ("/accept", "/reject-mid", "/reject-slow"):
             await _send_json(conn, writer, 404, {"error": f"unknown path {target}"})
             return
 
-        # /accept 与 /reject-mid 都先放行（100 Continue）
+        # /accept、/reject-mid、/reject-slow 都先放行（100 Continue）
         await send_event(
             conn, writer,
             h11.InformationalResponse(status_code=100, headers=[]),
@@ -174,20 +209,31 @@ async def _handle(
             log.info("源站收完 %s，正文 %d 字节，回 200", target, received)
             return
 
-        # /reject-mid：读够阈值后立刻拒收，剩余正文不再读
+        if target == "/reject-mid":
+            # 读够阈值后立刻拒收，剩余正文不再读
+            received = await _drain_body_until(
+                conn, reader, settings.reject_after_bytes, settings.idle_timeout
+            )
+            await stats.record(target, received)
+            await _send_json(
+                conn, writer, 413,
+                {
+                    "error": "payload too large: rejected mid-stream",
+                    "path": target,
+                    "received_before_reject": received,
+                },
+            )
+            log.info("源站中途拒收 %s，拒收前已读 %d 字节", target, received)
+            return
+
+        # /reject-slow：读够阈值后分段慢发 413 拒收说明（chunked）
         received = await _drain_body_until(
             conn, reader, settings.reject_after_bytes, settings.idle_timeout
         )
         await stats.record(target, received)
-        await _send_json(
-            conn, writer, 413,
-            {
-                "error": "payload too large: rejected mid-stream",
-                "path": target,
-                "received_before_reject": received,
-            },
-        )
-        log.info("源站中途拒收 %s，拒收前已读 %d 字节", target, received)
+        await _send_slow_413(conn, writer, received, settings)
+        log.info("源站中途拒收 %s（慢速分段 413），拒收前已读 %d 字节",
+                 target, received)
 
     except (ConnectionError, BrokenPipeError, h11.RemoteProtocolError,
             asyncio.TimeoutError, PausedError) as exc:
